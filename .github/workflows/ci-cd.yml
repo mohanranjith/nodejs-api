@@ -1,0 +1,217 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY_ALIAS: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+  IMAGE_NAME: nodejs-api
+
+jobs:
+  lint:
+    name: Lint Code
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@b4ffde65f69735aad63487c1169896c199e89eaf
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@8f152de45cc393bb48ce5d6f0381a57a7ed4bf0a
+        with:
+          node-version: '20.10.0'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint --if-present
+
+      - name: Run Prettier
+        run: npm run format:check --if-present
+
+  test:
+    name: Run Tests
+    runs-on: ubuntu-22.04
+    needs: lint
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@b4ffde65f69735aad63487c1169896c199e89eaf
+
+      - name: Setup Node.js
+        uses: actions/setup-node@8f152de45cc393bb48ce5d6f0381a57a7ed4bf0a
+        with:
+          node-version: '20.10.0'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests
+        run: npm test -- --coverage --passWithNoTests
+
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@26f96dfc697d77e81fd5907df203aa23a56210f8
+        if: always()
+        with:
+          name: coverage-reports
+          path: coverage/
+          retention-days: 30
+
+  build:
+    name: Build Application
+    runs-on: ubuntu-22.04
+    needs: test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@b4ffde65f69735aad63487c1169896c199e89eaf
+
+      - name: Setup Node.js
+        uses: actions/setup-node@8f152de45cc393bb48ce5d6f0381a57a7ed4bf0a
+        with:
+          node-version: '20.10.0'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        run: npm run build --if-present
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@26f96dfc697d77e81fd5907df203aa23a56210f8
+        with:
+          name: build-artifacts
+          path: |
+            dist/
+            node_modules/
+            package.json
+            package-lock.json
+          retention-days: 1
+
+  docker-build-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-22.04
+    needs: build
+    if: github.event_name == 'push'
+    outputs:
+      image-uri: ${{ steps.image.outputs.image-uri }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@b4ffde65f69735aad63487c1169896c199e89eaf
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@6b208ae046db98c579e8a3aa621ab581ff575935
+        with:
+          name: build-artifacts
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aabea0ba9c0d1b16689709525c965
+
+      - name: Build Docker image
+        id: docker-build
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: ${{ env.IMAGE_NAME }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $REGISTRY/$REPOSITORY:$IMAGE_TAG -t $REGISTRY/$REPOSITORY:latest .
+          echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Push Docker image to ECR
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: ${{ env.IMAGE_NAME }}
+          IMAGE_TAG: ${{ steps.docker-build.outputs.image-tag }}
+        run: |
+          docker push $REGISTRY/$REPOSITORY:$IMAGE_TAG
+          docker push $REGISTRY/$REPOSITORY:latest
+          echo "image-uri=$REGISTRY/$REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Set image URI output
+        id: image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: ${{ env.IMAGE_NAME }}
+          IMAGE_TAG: ${{ steps.docker-build.outputs.image-tag }}
+        run: |
+          echo "image-uri=$REGISTRY/$REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-22.04
+    needs: docker-build-push
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@b4ffde65f69735aad63487c1169896c199e89eaf
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@a1502cd9aee432aca07f620e2dce6b0EDA834ffF
+        with:
+          terraform_version: 1.6.0
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: terraform init
+
+      - name: Terraform Validate
+        working-directory: ./terraform
+        run: terraform validate
+
+      - name: Terraform Plan
+        working-directory: ./terraform
+        env:
+          TF_VAR_image_uri: ${{ needs.docker-build-push.outputs.image-uri }}
+        run: terraform plan -out=tfplan
+
+      - name: Upload Terraform Plan
+        uses: actions/upload-artifact@26f96dfc697d77e81fd5907df203aa23a56210f8
+        with:
+          name: tfplan
+          path: terraform/tfplan
+          retention-days: 7
+
+  deploy:
+    name: Deploy to AWS ECS
+    runs-on: ubuntu-22.04
+    needs: docker-build-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@b4ffde65f69735aad63487c1169896c199e89eaf
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
